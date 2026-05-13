@@ -143,7 +143,7 @@ actor:
   # Override the default values in training_backend/fsdp
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "no_shard"
+    sharding_strategy: "full_shard"
     use_orig_params: True
     gradient_checkpointing: True
     mixed_precision:

@@ -89,6 +89,10 @@ def get_model(
     if torch_dtype is not None:
         deepthinkvla_model = deepthinkvla_model.to(dtype=torch_dtype)
 
+    # Enable native HuggingFace gradient checkpointing with use_reentrant=False
+    # This completely bypasses the FSDP unshard bug where parameters have size (0,)
+    deepthinkvla_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
     return DeepThinkVLAForRLActionPrediction(
         deepthinkvla_model=deepthinkvla_model,
         processor=processor,
