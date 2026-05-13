@@ -35,6 +35,7 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
     def __init__(
         self,
         deepthinkvla_model: nn.Module,
+        processor: Any,
         action_dim: int,
         num_action_chunks: int,
         add_value_head: bool = True,
@@ -43,6 +44,7 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
     ):
         super().__init__()
         self.deepthinkvla_model = deepthinkvla_model
+        self.processor = processor
         self.action_dim = int(action_dim)
         self.num_action_chunks = int(num_action_chunks)
         self.unnorm_key = unnorm_key
@@ -118,24 +120,37 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
     ) -> tuple[np.ndarray, dict[str, Any]]:
         
         # Prepare inputs from env_obs
-        # Assuming env_obs has pixel_values and input_ids
-        pixel_values = env_obs.get("pixel_values", env_obs.get("image"))
-        input_ids = env_obs.get("input_ids", env_obs.get("prompt"))
-        attention_mask = env_obs.get("attention_mask")
+        from experiments.deepthinkvla_utils import prepare_image_for_vla
+        from sft.constants import THINK_PREFIX
         
-        if isinstance(pixel_values, list):
-            pixel_values = torch.cat(pixel_values, dim=0)
+        main_images = env_obs.get("main_images")
+        wrist_images = env_obs.get("wrist_images")
+        task_descriptions = env_obs.get("task_descriptions")
         
-        if pixel_values.ndim == 3:
-            pixel_values = pixel_values.unsqueeze(0)
+        if isinstance(main_images, torch.Tensor):
+            main_images = main_images.detach().cpu().numpy()
+        if wrist_images is not None and isinstance(wrist_images, torch.Tensor):
+            wrist_images = wrist_images.detach().cpu().numpy()
             
-        bsz = pixel_values.shape[0]
-
-        # In case we don't have input_ids
-        if input_ids is None:
-            # Need a fallback, but for now we assume they are provided
-            pass
+        bsz = main_images.shape[0]
+        batch_images = []
+        batch_texts = []
+        
+        for i in range(bsz):
+            img_list = [prepare_image_for_vla(main_images[i])]
+            if wrist_images is not None:
+                img_list.append(prepare_image_for_vla(wrist_images[i]))
             
+            task_label = str(task_descriptions[i]) if task_descriptions is not None else ""
+            prompt = self.processor.tokenizer.additional_special_tokens[0] * len(img_list) + THINK_PREFIX + f"Task: {task_label.lower()};"
+            
+            batch_images.append(img_list)
+            batch_texts.append(prompt)
+            
+        inputs = self.processor(text=batch_texts, images=batch_images, return_tensors="pt", padding=True)
+        input_ids = inputs["input_ids"]
+        pixel_values = inputs["pixel_values"]
+        attention_mask = inputs.get("attention_mask")
         do_sample = kwargs.get("do_sample", mode == "train")
         temperature = kwargs.get("temperature", 1.0)
         

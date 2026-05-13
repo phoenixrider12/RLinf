@@ -79,6 +79,8 @@ def get_model(
 
     # Use AutoModel or DeepThinkVLA.from_pretrained to load
     # For now we use the DeepThinkVLA class from their source
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained(model_path)
     deepthinkvla_model = DeepThinkVLA.from_pretrained(
         model_path,
         torch_dtype=torch_dtype if torch_dtype is not None else torch.float32,
@@ -89,6 +91,7 @@ def get_model(
 
     return DeepThinkVLAForRLActionPrediction(
         deepthinkvla_model=deepthinkvla_model,
+        processor=processor,
         action_dim=cfg.action_dim,
         num_action_chunks=cfg.num_action_chunks,
         add_value_head=getattr(cfg, "add_value_head", True),
