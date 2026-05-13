@@ -178,10 +178,32 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         env_chunk_actions = env_chunk_actions.reshape(bsz, self.num_action_chunks, self.action_dim)
 
         
+        seq_len = return_input_cot_ids.shape[1]
+        if not hasattr(self, "_target_seq_len"):
+            max_new = kwargs.get("max_new_tokens", 256)
+            self._target_seq_len = int((max(1024, seq_len + max_new) + 63) // 64 * 64)
+            
+        target_len = self._target_seq_len
+        if seq_len < target_len:
+            pad_len = target_len - seq_len
+            pad_id = self.processor.tokenizer.pad_token_id or 0
+            
+            pad_tensor = torch.full((bsz, pad_len), pad_id, device=return_input_cot_ids.device, dtype=return_input_cot_ids.dtype)
+            return_input_cot_ids = torch.cat([return_input_cot_ids, pad_tensor], dim=1)
+            
+            if return_attention_mask is not None:
+                pad_mask = torch.zeros((bsz, pad_len), device=return_attention_mask.device, dtype=return_attention_mask.dtype)
+                return_attention_mask = torch.cat([return_attention_mask, pad_mask], dim=1)
+        elif seq_len > target_len:
+            # Force truncate if it somehow exceeds to prevent stacking crash
+            return_input_cot_ids = return_input_cot_ids[:, :target_len]
+            if return_attention_mask is not None:
+                return_attention_mask = return_attention_mask[:, :target_len]
+                
         num_images_per_sample = pixel_values.shape[0] // bsz
         forward_inputs = {
             "input_cot_ids": return_input_cot_ids.cpu(),
-            "attention_mask": return_attention_mask.cpu(),
+            "attention_mask": return_attention_mask.cpu() if return_attention_mask is not None else torch.ones_like(return_input_cot_ids).cpu(),
             "pixel_values": pixel_values.cpu().view(bsz, num_images_per_sample, *pixel_values.shape[1:]),
             "action": torch.from_numpy(env_chunk_actions).view(bsz, -1)
         }
