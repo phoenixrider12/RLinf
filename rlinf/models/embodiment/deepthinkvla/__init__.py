@@ -37,7 +37,7 @@ def get_model(
         )
 
     # Append path to user's deepthinkvla implementation
-    sys.path.append("/data/aryaman/DeepThinkVLA_RL/src")
+    sys.path.append("/workspace/RLinf/DeepThinkVLA/src")
     
     try:
         from sft.modeling_deepthinkvla import DeepThinkVLA
@@ -46,7 +46,7 @@ def get_model(
     except ModuleNotFoundError as e:
         raise ModuleNotFoundError(
             "Could not import DeepThinkVLA from sft.modeling_deepthinkvla. "
-            "Please ensure /data/aryaman/DeepThinkVLA_RL/src is available."
+            "Please ensure /workspace/RLinf/DeepThinkVLA/src is available."
         ) from e
 
     logger.info(f"Loading DeepThinkVLA checkpoint: {model_path}")
