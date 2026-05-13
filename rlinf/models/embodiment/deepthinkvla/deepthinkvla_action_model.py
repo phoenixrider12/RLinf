@@ -104,7 +104,16 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         
         result = {}
         if compute_logprobs:
-            result["logprobs"] = None # To be implemented
+            from verl.utils.torch_functional import logprobs_from_logits
+            
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = input_cot_ids[..., 1:].contiguous()
+            
+            logprobs = logprobs_from_logits(shift_logits, shift_labels, inplace_backward=False)
+            
+            # Pad the first token with 0 to restore the full seq_len shape
+            logprobs = torch.cat([torch.zeros_like(logprobs[:, :1]), logprobs], dim=1)
+            result["logprobs"] = logprobs
         if compute_entropy:
             result["entropy"] = None
         if compute_values and self.value_head is not None:
