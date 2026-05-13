@@ -86,8 +86,8 @@ env:
   # Override the default values in env/libero_10
   train:
     total_num_envs: 8
-    max_episode_steps: 5
-    max_steps_per_rollout_epoch: 5
+    max_episode_steps: 10
+    max_steps_per_rollout_epoch: 10
   eval:
     total_num_envs: 1
     max_episode_steps: 10
