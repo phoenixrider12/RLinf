@@ -159,14 +159,15 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
                 
             seq_logprobs = cot_seq_logprobs + action_seq_logprobs
                 
-            dummy_logprobs = torch.zeros(bsz, self.num_action_chunks, self.action_dim, device=logprobs.device, dtype=torch.float32)
+            dummy_logprobs = torch.zeros(bsz, self.num_action_chunks, self.action_dim, device=logits_all.device, dtype=torch.float32)
             dummy_logprobs[:, 0, 0] = seq_logprobs
             result["logprobs"] = dummy_logprobs
         if compute_entropy:
             result["entropy"] = None
         if compute_values and self.value_head is not None:
-            hidden_states = outputs.hidden_states[-1] if hasattr(outputs, "hidden_states") else None
-            result["values"] = self.value_head(hidden_states).squeeze(-1) if hidden_states is not None else None
+            # We don't have outputs.hidden_states from prompt_cot_predict_action easily,
+            # but since GRPO doesn't use the value head anyway, we can just return None.
+            result["values"] = None
 
         return result
 
