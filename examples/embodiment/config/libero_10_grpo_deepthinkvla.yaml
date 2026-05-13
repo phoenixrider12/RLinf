@@ -73,6 +73,13 @@ algorithm:
     repetition_penalty: 1.0
     add_BOS: False
 
+  # length argument for autoregressive sampling
+  # max length means max amount of tokens to generate
+  length_params:
+    max_new_token: null
+    max_length: 1024
+    min_length: 1
+
 env:
   group_name: "EnvGroup"
 
