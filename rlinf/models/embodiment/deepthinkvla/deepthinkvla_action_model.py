@@ -110,10 +110,21 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
             shift_labels = input_cot_ids[..., 1:].contiguous()
             
             logprobs = logprobs_from_logits(shift_logits, shift_labels, inplace_backward=False)
-            
-            # Pad the first token with 0 to restore the full seq_len shape
             logprobs = torch.cat([torch.zeros_like(logprobs[:, :1]), logprobs], dim=1)
-            result["logprobs"] = logprobs
+            
+            bsz = logprobs.shape[0]
+            seq_logprobs = torch.zeros(bsz, device=logprobs.device, dtype=torch.float32)
+            prompt_lens = forward_inputs.get("prompt_lens", None)
+            
+            if prompt_lens is not None:
+                for i in range(bsz):
+                    seq_logprobs[i] = logprobs[i, prompt_lens[i]:].sum()
+            else:
+                seq_logprobs = logprobs.sum(dim=-1)
+                
+            dummy_logprobs = torch.zeros(bsz, self.num_action_chunks, self.action_dim, device=logprobs.device, dtype=torch.float32)
+            dummy_logprobs[:, 0, 0] = seq_logprobs
+            result["logprobs"] = dummy_logprobs
         if compute_entropy:
             result["entropy"] = None
         if compute_values and self.value_head is not None:
@@ -178,6 +189,29 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
                 temperature=temperature,
             )
             
+            prompt_len = input_ids.shape[1]
+            if calculate_logprobs:
+                outputs = self.deepthinkvla_model(
+                    input_ids=return_input_cot_ids,
+                    pixel_values=pixel_values.to(self.deepthinkvla_model.device),
+                    attention_mask=return_attention_mask,
+                    labels=return_input_cot_ids.clone()
+                )
+                from verl.utils.torch_functional import logprobs_from_logits
+                shift_logits = outputs.logits[..., :-1, :].contiguous()
+                shift_labels = return_input_cot_ids[..., 1:].contiguous()
+                logprobs = logprobs_from_logits(shift_logits, shift_labels, inplace_backward=False)
+                logprobs = torch.cat([torch.zeros_like(logprobs[:, :1]), logprobs], dim=1)
+                
+                seq_logprobs = torch.zeros(bsz, device=logprobs.device, dtype=torch.float32)
+                for i in range(bsz):
+                    seq_logprobs[i] = logprobs[i, prompt_len:].sum()
+                    
+                prev_logprobs = torch.zeros(bsz, self.num_action_chunks, self.action_dim, dtype=torch.float32)
+                prev_logprobs[:, 0, 0] = seq_logprobs.cpu()
+            else:
+                prev_logprobs = None
+            
         if self.unnormalize_action_fn is not None:
             unnormalized = self.unnormalize_action_fn(torch.from_numpy(normalized_actions))
             env_chunk_actions = unnormalized.numpy()
@@ -186,7 +220,6 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
             
         env_chunk_actions = env_chunk_actions.reshape(bsz, self.num_action_chunks, self.action_dim)
 
-        
         seq_len = return_input_cot_ids.shape[1]
         if not hasattr(self, "_target_seq_len"):
             max_new = kwargs.get("max_new_tokens")
@@ -216,11 +249,12 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
             "input_cot_ids": return_input_cot_ids.cpu(),
             "attention_mask": return_attention_mask.cpu() if return_attention_mask is not None else torch.ones_like(return_input_cot_ids).cpu(),
             "pixel_values": pixel_values.cpu().view(bsz, num_images_per_sample, *pixel_values.shape[1:]),
+            "prompt_lens": torch.full((bsz,), prompt_len, dtype=torch.int64).cpu(),
             "action": torch.from_numpy(env_chunk_actions).view(bsz, -1)
         }
         
         result = {
-            "prev_logprobs": torch.zeros(bsz, dtype=torch.float32) if calculate_logprobs else None,
+            "prev_logprobs": prev_logprobs,
             "prev_values": torch.zeros(bsz, dtype=torch.float32) if calculate_values else None,
             "forward_inputs": forward_inputs,
         }
