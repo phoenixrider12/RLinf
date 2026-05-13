@@ -120,8 +120,7 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
     ) -> tuple[np.ndarray, dict[str, Any]]:
         
         # Prepare inputs from env_obs
-        from experiments.deepthinkvla_utils import prepare_image_for_vla
-        from sft.constants import THINK_PREFIX
+        from experiments.deepthinkvla_utils import prepare_image_for_vla, THINK_PREFIX
         
         main_images = env_obs.get("main_images")
         wrist_images = env_obs.get("wrist_images")
