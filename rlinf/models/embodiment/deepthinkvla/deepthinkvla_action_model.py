@@ -82,6 +82,10 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         pixel_values = forward_inputs["pixel_values"]
         attention_mask = forward_inputs["attention_mask"]
 
+        if pixel_values.ndim == 5:
+            bsz, num_images = pixel_values.shape[:2]
+            pixel_values = pixel_values.view(bsz * num_images, *pixel_values.shape[2:])
+
         # This will call forward of DeepThinkVLA with cot_length
         # Since RLinf provides the full trajectory, we need to extract prompt+cot and action parts.
         # But wait! deepthinkvla forward signature has `cot_length` argument for training...
@@ -174,10 +178,11 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         env_chunk_actions = env_chunk_actions.reshape(bsz, self.num_action_chunks, self.action_dim)
 
         
+        num_images_per_sample = pixel_values.shape[0] // bsz
         forward_inputs = {
             "input_cot_ids": return_input_cot_ids.cpu(),
             "attention_mask": return_attention_mask.cpu(),
-            "pixel_values": pixel_values.cpu(),
+            "pixel_values": pixel_values.cpu().view(bsz, num_images_per_sample, *pixel_values.shape[1:]),
             "action": torch.from_numpy(env_chunk_actions).view(bsz, -1)
         }
         
