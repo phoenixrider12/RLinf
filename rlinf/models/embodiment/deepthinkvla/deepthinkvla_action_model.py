@@ -182,8 +182,8 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         }
         
         result = {
-            "prev_logprobs": None, # Should be calculated
-            "prev_values": None,
+            "prev_logprobs": torch.zeros(bsz, dtype=torch.float32) if calculate_logprobs else None,
+            "prev_values": torch.zeros(bsz, dtype=torch.float32) if calculate_values else None,
             "forward_inputs": forward_inputs,
         }
         
