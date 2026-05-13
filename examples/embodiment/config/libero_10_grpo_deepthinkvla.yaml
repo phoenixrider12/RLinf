@@ -116,7 +116,7 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 2
+  micro_batch_size: 1
   global_batch_size: 8 # maximum : global batch size = micro batch size * actor num_processes.
   seed: 42
   enable_offload: False
