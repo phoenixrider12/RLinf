@@ -109,6 +109,7 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
             from verl.utils.torch_functional import logprobs_from_logits
             
             pad_id = self.deepthinkvla_model.pad_token_id
+            input_cot_ids = input_cot_ids.to(self.deepthinkvla_model.device)
             
             # SINGLE FORWARD PASS
             logits_all, action_start_idx = self.deepthinkvla_model.prompt_cot_predict_action(
@@ -157,8 +158,9 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
             
             if prompt_lens is not None:
                 for i in range(bsz):
-                    actual_prompt_len = input_cot_ids[i, :prompt_lens[i]].ne(pad_id).sum()
-                    start = actual_prompt_len
+                    # Use the provided prompt_lens directly. In right-padded sequence, 
+                    # the CoT tokens start exactly at prompt_lens[i].
+                    start = prompt_lens[i]
                     end = action_start_idx[i] + 1
                     cot_seq_logprobs[i] = cot_all_logprobs[i, start:end].sum()
             else:
@@ -329,7 +331,8 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
             "attention_mask": return_attention_mask.cpu() if return_attention_mask is not None else torch.ones_like(return_input_cot_ids).cpu(),
             "pixel_values": pixel_values.cpu().view(bsz, num_images_per_sample, *pixel_values.shape[1:]),
             "prompt_lens": torch.full((bsz,), prompt_len, dtype=torch.int64).cpu(),
-            "action": torch.from_numpy(env_chunk_actions).view(bsz, -1)
+            "action": torch.from_numpy(env_chunk_actions).view(bsz, -1),
+            "action_tokens": predicted_action_token_ids.cpu()
         }
         
         result = {
