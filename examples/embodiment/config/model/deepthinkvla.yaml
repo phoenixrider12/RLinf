@@ -1,7 +1,7 @@
 model_type: "deepthinkvla"
 
 # Model path - should be set in specific config files
-model_path: "/yinchenghust/deepthinkvla_libero_cot_sft"
+model_path: "/workspace/DeepThinkVLA/yinchenghust/deepthinkvla_libero_cot_sft"
 
 precision: null
 
