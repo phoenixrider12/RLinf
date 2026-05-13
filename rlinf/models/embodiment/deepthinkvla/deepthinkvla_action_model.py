@@ -95,48 +95,31 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         # We need to compute logprobs of the generated sequence
         # DeepThinkVLA handles this differently. Let's do a simple forward for now.
         
-        outputs = self.deepthinkvla_model(
-            input_ids=input_cot_ids,
-            pixel_values=pixel_values,
-            attention_mask=attention_mask,
-            labels=input_cot_ids.clone()
-        )
-        
         result = {}
         if compute_logprobs:
             from verl.utils.torch_functional import logprobs_from_logits
             
-            shift_logits = outputs.logits[..., :-1, :].contiguous()
-            shift_labels = input_cot_ids[..., 1:].contiguous()
+            pad_id = self.deepthinkvla_model.pad_token_id
             
-            logprobs = logprobs_from_logits(shift_logits, shift_labels, inplace_backward=False)
-            logprobs = torch.cat([torch.zeros_like(logprobs[:, :1]), logprobs], dim=1)
+            # SINGLE FORWARD PASS
+            logits_all, action_start_idx = self.deepthinkvla_model.prompt_cot_predict_action(
+                input_cot_ids=input_cot_ids,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+            )
             
-            bsz = logprobs.shape[0]
-            cot_seq_logprobs = torch.zeros(bsz, device=logprobs.device, dtype=torch.float32)
-            prompt_lens = forward_inputs.get("prompt_lens", None)
+            bsz = logits_all.shape[0]
             
-            if prompt_lens is not None:
-                for i in range(bsz):
-                    cot_seq_logprobs[i] = logprobs[i, prompt_lens[i]:].sum()
-            else:
-                cot_seq_logprobs = logprobs.sum(dim=-1)
-                
-            # Compute action logprobs via bidirectional non-causal attention
+            # 1. Action Logprobs
             action_tokens = forward_inputs.get("action_tokens")
             if action_tokens is not None:
-                action_tokens = action_tokens.to(logprobs.device)
-                logits_action, action_start_idx = self.deepthinkvla_model.prompt_cot_predict_action(
-                    input_cot_ids=input_cot_ids,
-                    pixel_values=pixel_values,
-                    attention_mask=attention_mask,
-                )
+                action_tokens = action_tokens.to(logits_all.device)
                 start_indices = action_start_idx.unsqueeze(1)
-                position_offsets = torch.arange(self.num_action_chunks * self.action_dim, device=logits_action.device).unsqueeze(0)
+                position_offsets = torch.arange(self.num_action_chunks * self.action_dim, device=logits_all.device).unsqueeze(0)
                 seq_indices = start_indices + position_offsets
                 
-                action_logits = logits_action[
-                    torch.arange(logits_action.shape[0], device=logits_action.device).unsqueeze(-1),
+                action_logits = logits_all[
+                    torch.arange(logits_all.shape[0], device=logits_all.device).unsqueeze(-1),
                     seq_indices,
                     self.deepthinkvla_model.config.action_token_begin_idx:self.deepthinkvla_model.config.action_token_end_idx + 1
                 ]
@@ -147,7 +130,32 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
                 
                 action_seq_logprobs = action_logprobs.sum(dim=-1)
             else:
-                action_seq_logprobs = torch.zeros(bsz, device=logprobs.device, dtype=torch.float32)
+                action_seq_logprobs = torch.zeros(bsz, device=logits_all.device, dtype=torch.float32)
+                
+            # 2. CoT Logprobs
+            sorted_indices = torch.argsort(((input_cot_ids.ne(pad_id))).int(), dim=1, descending=True, stable=True)
+            sorted_input_cot_ids = torch.gather(input_cot_ids, 1, sorted_indices).to(logits_all.device)
+            
+            cot_logits = logits_all[:, :sorted_input_cot_ids.shape[1]]
+            shift_logits = cot_logits[..., :-1, :].contiguous()
+            shift_labels = sorted_input_cot_ids[..., 1:].contiguous()
+            
+            cot_all_logprobs = logprobs_from_logits(shift_logits, shift_labels, inplace_backward=False)
+            cot_all_logprobs = torch.cat([torch.zeros_like(cot_all_logprobs[:, :1]), cot_all_logprobs], dim=1)
+            
+            cot_seq_logprobs = torch.zeros(bsz, device=logits_all.device, dtype=torch.float32)
+            prompt_lens = forward_inputs.get("prompt_lens", None)
+            
+            if prompt_lens is not None:
+                for i in range(bsz):
+                    actual_prompt_len = input_cot_ids[i, :prompt_lens[i]].ne(pad_id).sum()
+                    start = actual_prompt_len
+                    end = action_start_idx[i] + 1
+                    cot_seq_logprobs[i] = cot_all_logprobs[i, start:end].sum()
+            else:
+                for i in range(bsz):
+                    end = action_start_idx[i] + 1
+                    cot_seq_logprobs[i] = cot_all_logprobs[i, :end].sum()
                 
             seq_logprobs = cot_seq_logprobs + action_seq_logprobs
                 
@@ -220,33 +228,22 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
             
             prompt_len = input_ids.shape[1]
             if calculate_logprobs:
-                outputs = self.deepthinkvla_model(
-                    input_ids=return_input_cot_ids,
-                    pixel_values=pixel_values.to(self.deepthinkvla_model.device),
-                    attention_mask=return_attention_mask,
-                    labels=return_input_cot_ids.clone()
-                )
-                from verl.utils.torch_functional import logprobs_from_logits
-                shift_logits = outputs.logits[..., :-1, :].contiguous()
-                shift_labels = return_input_cot_ids[..., 1:].contiguous()
-                logprobs = logprobs_from_logits(shift_logits, shift_labels, inplace_backward=False)
-                logprobs = torch.cat([torch.zeros_like(logprobs[:, :1]), logprobs], dim=1)
+                pad_id = self.deepthinkvla_model.pad_token_id
                 
-                cot_seq_logprobs = torch.zeros(bsz, device=logprobs.device, dtype=torch.float32)
-                for i in range(bsz):
-                    cot_seq_logprobs[i] = logprobs[i, prompt_len:].sum()
-                    
-                logits_action, action_start_idx = self.deepthinkvla_model.prompt_cot_predict_action(
+                # SINGLE FORWARD PASS
+                logits_all, action_start_idx = self.deepthinkvla_model.prompt_cot_predict_action(
                     input_cot_ids=return_input_cot_ids,
                     pixel_values=pixel_values.to(self.deepthinkvla_model.device),
                     attention_mask=return_attention_mask,
                 )
+                
+                # 1. Action Logprobs
                 start_indices = action_start_idx.unsqueeze(1)
-                position_offsets = torch.arange(self.num_action_chunks * self.action_dim, device=logits_action.device).unsqueeze(0)
+                position_offsets = torch.arange(self.num_action_chunks * self.action_dim, device=logits_all.device).unsqueeze(0)
                 seq_indices = start_indices + position_offsets
                 
-                action_logits = logits_action[
-                    torch.arange(logits_action.shape[0], device=logits_action.device).unsqueeze(-1),
+                action_logits = logits_all[
+                    torch.arange(logits_all.shape[0], device=logits_all.device).unsqueeze(-1),
                     seq_indices,
                     self.deepthinkvla_model.config.action_token_begin_idx:self.deepthinkvla_model.config.action_token_end_idx + 1
                 ]
@@ -256,6 +253,27 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
                 action_logprobs = torch.gather(action_logp, 2, action_responses.unsqueeze(2)).squeeze(2)
                 
                 action_seq_logprobs = action_logprobs.sum(dim=-1)
+                
+                # 2. CoT Logprobs
+                sorted_indices = torch.argsort(((return_input_cot_ids.ne(pad_id))).int(), dim=1, descending=True, stable=True)
+                sorted_input_cot_ids = torch.gather(return_input_cot_ids, 1, sorted_indices).to(logits_all.device)
+                
+                cot_logits = logits_all[:, :sorted_input_cot_ids.shape[1]]
+                shift_logits = cot_logits[..., :-1, :].contiguous()
+                shift_labels = sorted_input_cot_ids[..., 1:].contiguous()
+                
+                from verl.utils.torch_functional import logprobs_from_logits
+                cot_all_logprobs = logprobs_from_logits(shift_logits, shift_labels, inplace_backward=False)
+                cot_all_logprobs = torch.cat([torch.zeros_like(cot_all_logprobs[:, :1]), cot_all_logprobs], dim=1)
+                
+                cot_seq_logprobs = torch.zeros(bsz, device=logits_all.device, dtype=torch.float32)
+                actual_prompt_lens = input_ids.ne(pad_id).sum(dim=1)
+                
+                for i in range(bsz):
+                    start = actual_prompt_lens[i]
+                    end = action_start_idx[i] + 1
+                    cot_seq_logprobs[i] = cot_all_logprobs[i, start:end].sum()
+                
                 seq_logprobs = cot_seq_logprobs + action_seq_logprobs
                     
                 prev_logprobs = torch.zeros(bsz, self.num_action_chunks, self.action_dim, dtype=torch.float32)
