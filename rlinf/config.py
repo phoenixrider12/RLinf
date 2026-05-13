@@ -87,6 +87,7 @@ SupportedModel.OPENVLA = SupportedModel.register("openvla", force=True)
 SupportedModel.OPENVLA_OFT = SupportedModel.register("openvla_oft", force=True)
 SupportedModel.OPENPI = SupportedModel.register("openpi", force=True)
 SupportedModel.STARVLA = SupportedModel.register("starvla", force=True)
+SupportedModel.DEEPTHINKVLA = SupportedModel.register("deepthinkvla", force=True)
 SupportedModel.MLP_POLICY = SupportedModel.register("mlp_policy", force=True)
 SupportedModel.GR00T = SupportedModel.register("gr00t", force=True)
 SupportedModel.DEXBOTIC_PI = SupportedModel.register("dexbotic_pi", force=True)
@@ -110,6 +111,7 @@ EMBODIED_MODEL = set(
         SupportedModel.OPENVLA_OFT,
         SupportedModel.OPENPI,
         SupportedModel.STARVLA,
+        SupportedModel.DEEPTHINKVLA,
         SupportedModel.MLP_POLICY,
         SupportedModel.GR00T,
         SupportedModel.DEXBOTIC_PI,

@@ -101,6 +101,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_deepthinkvla(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.deepthinkvla import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_dreamzero(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.dreamzero import get_model
 
@@ -179,6 +184,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.STARVLA.value,
         _build_starvla,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        SupportedModel.DEEPTHINKVLA.value,
+        _build_deepthinkvla,
         category="embodied",
         force=True,
     )

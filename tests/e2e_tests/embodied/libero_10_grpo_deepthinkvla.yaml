@@ -124,7 +124,7 @@ actor:
   # Override the default values in model/pi0
   model:
     model_path: "yinchenghust/deepthinkvla_libero_cot_sft"
-    num_action_chunks: 5 # interface for the env
+    num_action_chunks: 10 # interface for the env
     add_value_head: True
     # openpi specific parameters
     # openpi:
