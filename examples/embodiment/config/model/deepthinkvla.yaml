@@ -1,4 +1,4 @@
-model_type: "openpi"
+model_type: "deepthinkvla"
 
 # Model path - should be set in specific config files
 model_path: "/yinchenghust/deepthinkvla_libero_cot_sft"
@@ -19,7 +19,7 @@ num_steps: 4
 add_value_head: False
 
 # openpi specific parameters
-openpi:
+deepthinkvla:
   config_name: "deepthinkvla_libero"
   num_images_in_input: 2
   noise_level: 0.5
