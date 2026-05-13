@@ -151,9 +151,8 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         pixel_values = inputs["pixel_values"]
         attention_mask = inputs.get("attention_mask")
         
-        num_images_per_sample = len(img_list)
-        if pixel_values.ndim == 4 and pixel_values.shape[0] == len(batch_images):
-            pixel_values = pixel_values.view(bsz, num_images_per_sample, *pixel_values.shape[1:])
+        # PaliGemma expects pixel_values to be 4D: [total_images_in_batch, C, H, W]
+        # The AutoProcessor already returns it as 4D. No reshaping needed!
         do_sample = kwargs.get("do_sample", mode == "train")
         temperature = kwargs.get("temperature", 1.0)
         
