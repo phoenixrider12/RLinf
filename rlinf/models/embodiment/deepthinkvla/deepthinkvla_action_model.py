@@ -180,7 +180,9 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         
         seq_len = return_input_cot_ids.shape[1]
         if not hasattr(self, "_target_seq_len"):
-            max_new = kwargs.get("max_new_tokens", 256)
+            max_new = kwargs.get("max_new_tokens")
+            if max_new is None:
+                max_new = 256
             self._target_seq_len = int((max(1024, seq_len + max_new) + 63) // 64 * 64)
             
         target_len = self._target_seq_len
