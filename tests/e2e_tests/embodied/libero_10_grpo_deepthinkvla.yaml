@@ -110,7 +110,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: " /workspace/DeepThinkVLA/yinchenghust/deepthinkvla_libero_cot_sft"
+    model_path: "/workspace/DeepThinkVLA/yinchenghust/deepthinkvla_libero_cot_sft"
     precision: ${actor.model.precision}
 
 actor:
@@ -123,7 +123,7 @@ actor:
 
   # Override the default values in model/pi0
   model:
-    model_path: " /workspace/DeepThinkVLA/yinchenghust/deepthinkvla_libero_cot_sft"
+    model_path: "/workspace/DeepThinkVLA/yinchenghust/deepthinkvla_libero_cot_sft"
     num_action_chunks: 10 # interface for the env
     add_value_head: True
     # openpi specific parameters
