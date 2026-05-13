@@ -332,6 +332,10 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         return env_chunk_actions, result
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        if gradient_checkpointing_kwargs is None:
+            gradient_checkpointing_kwargs = {"use_reentrant": False}
+        elif "use_reentrant" not in gradient_checkpointing_kwargs:
+            gradient_checkpointing_kwargs["use_reentrant"] = False
         self.deepthinkvla_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
 
     def gradient_checkpointing_disable(self):
