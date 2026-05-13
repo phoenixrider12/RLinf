@@ -143,13 +143,17 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
             task_label = str(task_descriptions[i]) if task_descriptions is not None else ""
             prompt = self.processor.tokenizer.additional_special_tokens[0] * len(img_list) + THINK_PREFIX + f"Task: {task_label.lower()};"
             
-            batch_images.append(img_list)
+            batch_images.extend(img_list)
             batch_texts.append(prompt)
             
         inputs = self.processor(text=batch_texts, images=batch_images, return_tensors="pt", padding=True)
         input_ids = inputs["input_ids"]
         pixel_values = inputs["pixel_values"]
         attention_mask = inputs.get("attention_mask")
+        
+        num_images_per_sample = len(img_list)
+        if pixel_values.ndim == 4 and pixel_values.shape[0] == len(batch_images):
+            pixel_values = pixel_values.view(bsz, num_images_per_sample, *pixel_values.shape[1:])
         do_sample = kwargs.get("do_sample", mode == "train")
         temperature = kwargs.get("temperature", 1.0)
         
