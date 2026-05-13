@@ -60,6 +60,15 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
             hidden_size = deepthinkvla_model.config.text_config.hidden_size
             self.value_head = nn.Linear(hidden_size, 1).to(dtype=policy_param_dtype)
 
+    @property
+    def _no_split_modules(self) -> list[str]:
+        return [
+            "GemmaDecoderLayer",
+            "SiglipVisionEmbeddings",
+            "GemmaRMSNorm",
+            "GemmaRotaryEmbedding",
+        ]
+
     def forward(
         self,
         forward_type: ForwardType = ForwardType.DEFAULT,
