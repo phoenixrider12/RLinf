@@ -76,7 +76,7 @@ algorithm:
   # length argument for autoregressive sampling
   # max length means max amount of tokens to generate
   length_params:
-    max_new_token: null
+    max_new_token: 300
     max_length: 1042
     min_length: 1
 
