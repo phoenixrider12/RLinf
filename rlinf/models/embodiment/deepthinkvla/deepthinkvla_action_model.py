@@ -226,8 +226,21 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         
         # PaliGemma expects pixel_values to be 4D: [total_images_in_batch, C, H, W]
         # The AutoProcessor already returns it as 4D. No reshaping needed!
-        do_sample = kwargs.get("do_sample", mode == "train")
-        temperature = kwargs.get("temperature", 1.0)
+        sampling_params = kwargs.get("sampling_params", {})
+        length_params = kwargs.get("length_params", {})
+        
+        do_sample = sampling_params.get("do_sample", mode == "train")
+        temperature = sampling_params.get("temperature_train" if mode == "train" else "temperature_eval", 1.0)
+        
+        from transformers import GenerationConfig
+        generation_config = GenerationConfig(
+            max_new_tokens=length_params.get("max_new_token", 300),
+            max_length=length_params.get("max_length", 1024),
+            do_sample=do_sample,
+            temperature=temperature,
+            pad_token_id=self.deepthinkvla_model.pad_token_id,
+            eos_token_id=self.deepthinkvla_model.config.eos_token_id,
+        )
         
         with torch.no_grad():
             normalized_actions, predicted_action_token_ids, return_input_cot_ids, return_attention_mask = self.deepthinkvla_model.generate_action_verl(
@@ -236,6 +249,7 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
                 attention_mask=attention_mask.to(self.deepthinkvla_model.device) if attention_mask is not None else None,
                 do_sample=do_sample,
                 temperature=temperature,
+                generation_config=generation_config,
             )
             
             prompt_len = input_ids.shape[1]
