@@ -1271,6 +1271,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_metrics.update(causal_reward_metrics)
         return rollout_metrics
 
+    @staticmethod
+    def _slice_forward_inputs(
+        step_fi: dict, start: int, end: int
+    ) -> dict:
+        """Slice a per-step forward_inputs dict along the batch (dim 0)."""
+        micro = {}
+        for key, val in step_fi.items():
+            if isinstance(val, torch.Tensor):
+                micro[key] = val[start:end]
+            elif isinstance(val, dict):
+                micro[key] = {k: v[start:end] for k, v in val.items()}
+            else:
+                micro[key] = val
+        return micro
+
     def _compute_cot_causal_rewards(
         self,
         rewards: torch.Tensor,
@@ -1284,6 +1299,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         The rewards tensor is augmented in-place (or a new tensor is returned)
         with bonus rewards derived from contrastive forward passes.
+
+        To avoid OOM the forward passes are micro-batched: each call processes
+        at most ``cot_causal_micro_batch_size`` samples (default 2). This keeps
+        peak memory bounded because the logits tensor
+        ``[micro_bsz, seq_len, vocab_size]`` is the dominant allocation.
 
         Args:
             rewards: Original environment rewards ``[n_chunk_step, batch, num_action_chunks]``.
@@ -1305,12 +1325,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         # forward_inputs shape: {key: [n_chunk_step, batch, ...]}
         # prev_logprobs shape: [n_chunk_step, batch, num_action_chunks, action_dim]
-        # We need to flatten the step & batch dims, run the model, then reshape.
         n_chunk_step, batch_size = rewards.shape[:2]
 
         # The normal action seq logprob is stored in prev_logprobs[:, :, 0, 0]
-        # (the dummy packing used by DeepThinkVLA puts the full seq logprob there)
         normal_action_logprobs = prev_logprobs[:, :, 0, 0]  # [n_chunk_step, batch]
+
+        # Micro-batch size for causal reward forward passes to avoid OOM.
+        # The dominant memory cost is logits: [mbs, seq_len, ~257k vocab] in float32.
+        # With mbs=2, seq_len=800: ~1.6GB per forward pass (manageable on 80GB GPUs).
+        causal_mbs = self.cfg.algorithm.get("cot_causal_micro_batch_size", 2)
 
         # Ensure model is on GPU for the extra forward passes
         if self.is_weight_offloaded:
@@ -1319,42 +1342,82 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         rewards = rewards.clone()
 
+        # Accumulators for metrics across all steps and micro-batches
+        all_causal_bonuses = []
+        all_wrong_bonuses = []
+
         # Use summon_full_params to unshard FSDP parameters for custom method
         # calls (compute_masked/wrong_cot_action_logprobs are not forward(),
         # so FSDP won't auto-gather sharded params without this context).
         with FSDP.summon_full_params(self.model, writeback=False, recurse=True):
-            # Process in chunks to avoid OOM — iterate over chunk steps
             for step_idx in range(n_chunk_step):
-                # Build per-step forward_inputs dict
+                # Build per-step forward_inputs dict (full batch on device)
                 step_fi = {}
                 for key, val in forward_inputs.items():
                     if isinstance(val, torch.Tensor):
-                        step_fi[key] = val[step_idx].to(self.device)  # [batch, ...]
+                        step_fi[key] = val[step_idx].to(self.device)
                     elif isinstance(val, dict):
                         step_fi[key] = {
                             k: v[step_idx].to(self.device) for k, v in val.items()
                         }
 
-                step_normal_logprobs = normal_action_logprobs[step_idx].to(self.device)  # [batch]
+                step_normal_logprobs = normal_action_logprobs[step_idx].to(self.device)
 
+                # --- Micro-batched masked-CoT reward ---
                 if use_cot_causal_reward and cot_causal_reward_coef > 0:
-                    masked_logprobs = self.model.compute_masked_cot_action_logprobs(step_fi)
+                    masked_lp_chunks = []
+                    for mb_start in range(0, batch_size, causal_mbs):
+                        mb_end = min(mb_start + causal_mbs, batch_size)
+                        micro_fi = self._slice_forward_inputs(step_fi, mb_start, mb_end)
+                        with torch.no_grad():
+                            mb_lp = self.model.compute_masked_cot_action_logprobs(micro_fi)
+                        masked_lp_chunks.append(mb_lp)
+                        del micro_fi, mb_lp
+                        clear_memory(sync=False)
+                    masked_logprobs = torch.cat(masked_lp_chunks, dim=0)
                     causal_bonus = cot_causal_reward_coef * (step_normal_logprobs - masked_logprobs)
-                    # Add to the first action chunk (chunk_level reward)
                     rewards[step_idx, :, 0] = rewards[step_idx, :, 0] + causal_bonus.cpu()
-                    metrics_out["cot_causal_reward/mean"] = float(causal_bonus.mean().item())
-                    metrics_out["cot_causal_reward/std"] = float(causal_bonus.std().item())
-                    del masked_logprobs, causal_bonus
+                    all_causal_bonuses.append(causal_bonus.detach())
+                    del masked_logprobs, causal_bonus, masked_lp_chunks
 
+                # --- Micro-batched wrong-CoT reward ---
                 if use_wrong_cot_causal_reward and wrong_cot_causal_reward_coef > 0:
-                    wrong_logprobs = self.model.compute_wrong_cot_action_logprobs(step_fi)
+                    # The circular CoT shift MUST happen on the full batch before
+                    # micro-batching, otherwise micro-batches of size 2 would only
+                    # swap between 2 samples instead of across all 64.
+                    # Pre-shift CoT tokens, then run masked forward (no internal shift).
+                    shifted_fi = self.model.prepare_wrong_cot_inputs(step_fi)
+                    wrong_lp_chunks = []
+                    for mb_start in range(0, batch_size, causal_mbs):
+                        mb_end = min(mb_start + causal_mbs, batch_size)
+                        micro_fi = self._slice_forward_inputs(shifted_fi, mb_start, mb_end)
+                        with torch.no_grad():
+                            # Use masked_cot forward (plain forward, no shift) on
+                            # pre-shifted inputs — skip the redundant first forward
+                            # pass in compute_masked by passing pre_shifted=True.
+                            mb_lp = self.model.compute_masked_cot_action_logprobs(
+                                micro_fi, skip_masking=True
+                            )
+                        wrong_lp_chunks.append(mb_lp)
+                        del micro_fi, mb_lp
+                        clear_memory(sync=False)
+                    wrong_logprobs = torch.cat(wrong_lp_chunks, dim=0)
                     wrong_bonus = wrong_cot_causal_reward_coef * (step_normal_logprobs - wrong_logprobs)
                     rewards[step_idx, :, 0] = rewards[step_idx, :, 0] + wrong_bonus.cpu()
-                    metrics_out["wrong_cot_causal_reward/mean"] = float(wrong_bonus.mean().item())
-                    metrics_out["wrong_cot_causal_reward/std"] = float(wrong_bonus.std().item())
-                    del wrong_logprobs, wrong_bonus
+                    all_wrong_bonuses.append(wrong_bonus.detach())
+                    del wrong_logprobs, wrong_bonus, wrong_lp_chunks
 
                 clear_memory(sync=False)
+
+        # Aggregate metrics across all chunk steps
+        if all_causal_bonuses:
+            all_cb = torch.cat(all_causal_bonuses)
+            metrics_out["cot_causal_reward/mean"] = float(all_cb.mean().item())
+            metrics_out["cot_causal_reward/std"] = float(all_cb.std().item())
+        if all_wrong_bonuses:
+            all_wb = torch.cat(all_wrong_bonuses)
+            metrics_out["wrong_cot_causal_reward/mean"] = float(all_wb.mean().item())
+            metrics_out["wrong_cot_causal_reward/std"] = float(all_wb.std().item())
 
         self.model.train()
         return rewards

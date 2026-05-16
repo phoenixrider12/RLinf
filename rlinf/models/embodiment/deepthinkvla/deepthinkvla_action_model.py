@@ -182,9 +182,39 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         return result
 
+    def _find_action_start_idx(self, input_cot_ids: torch.Tensor) -> torch.Tensor:
+        """Find the first action token position in each sequence without a forward pass.
+
+        Scans ``input_cot_ids`` for tokens in the action-token range
+        ``[action_token_begin_idx, action_token_end_idx]`` and returns the
+        index of the first match per sample.
+
+        Args:
+            input_cot_ids: Token IDs ``[bsz, seq_len]``.
+
+        Returns:
+            ``action_start_idx`` tensor of shape ``[bsz]`` with the position of
+            the first action token in each sample. If no action token is found,
+            defaults to ``seq_len - 1``.
+        """
+        begin_id = self.deepthinkvla_model.config.action_token_begin_idx
+        end_id = self.deepthinkvla_model.config.action_token_end_idx
+        # Boolean mask: True where token is an action token
+        is_action = (input_cot_ids >= begin_id) & (input_cot_ids <= end_id)
+        # argmax on a bool tensor returns the index of the first True.
+        # If no True exists, argmax returns 0 — we detect that case and
+        # fall back to seq_len - 1.
+        first_action_pos = is_action.int().argmax(dim=-1)  # [bsz]
+        # Fix samples where no action token was found (argmax returned 0 but
+        # position 0 is not actually an action token).
+        no_action_mask = ~is_action.any(dim=-1)
+        first_action_pos[no_action_mask] = input_cot_ids.shape[1] - 1
+        return first_action_pos
+
     def compute_masked_cot_action_logprobs(
         self,
         forward_inputs: dict[str, torch.Tensor],
+        skip_masking: bool = False,
     ) -> torch.Tensor:
         """Compute action log-probabilities with CoT tokens masked out of attention.
 
@@ -193,9 +223,14 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         action log-probabilities can be compared to the normal ones to measure
         how much the CoT causally influences actions.
 
+        When ``skip_masking=True``, no attention masking is applied — this is
+        used for the wrong-CoT path where CoT tokens have already been shifted
+        at the batch level and we just need a plain forward pass.
+
         Args:
             forward_inputs: Dict with ``input_cot_ids``, ``pixel_values``,
                 ``attention_mask``, ``prompt_lens``, and ``action_tokens``.
+            skip_masking: If True, skip zeroing out CoT attention positions.
 
         Returns:
             Scalar action-sequence log-probability per sample ``[bsz]``.
@@ -212,108 +247,86 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         bsz = input_cot_ids.shape[0]
 
-        # Determine where CoT tokens live and zero them out in the mask.
-        # CoT starts right after the prompt and ends at the action start.
-        pad_id = self.deepthinkvla_model.pad_token_id
-        # We need action_start_idx to know CoT boundaries. Run a quick forward
-        # to get it (we could also derive it from prompt_lens + cot length, but
-        # using the model ensures consistency).
-        with torch.no_grad():
-            _, action_start_idx = self.deepthinkvla_model.prompt_cot_predict_action(
-                input_cot_ids=input_cot_ids,
-                pixel_values=pixel_values,
-                attention_mask=forward_inputs["attention_mask"].clone().to(self.deepthinkvla_model.device),
-            )
+        # Find action start positions by scanning token IDs — no forward pass needed.
+        action_start_idx = self._find_action_start_idx(input_cot_ids)
 
-        # Zero out CoT positions in the attention mask
-        if prompt_lens is not None:
-            prompt_lens_dev = prompt_lens.to(input_cot_ids.device)
-            for i in range(bsz):
-                cot_start = int(prompt_lens_dev[i].item())
-                cot_end = int(action_start_idx[i].item())
-                attention_mask[i, cot_start:cot_end] = 0
+        if not skip_masking:
+            # Zero out CoT positions in the attention mask
+            if prompt_lens is not None:
+                prompt_lens_dev = prompt_lens.to(input_cot_ids.device)
+                for i in range(bsz):
+                    cot_start = int(prompt_lens_dev[i].item())
+                    cot_end = int(action_start_idx[i].item())
+                    attention_mask[i, cot_start:cot_end] = 0
 
-        # Forward with masked attention
+        # Forward (with masked or unmodified attention depending on skip_masking)
         with torch.no_grad():
-            logits_masked, action_start_idx_masked = self.deepthinkvla_model.prompt_cot_predict_action(
+            logits_out, action_start_idx_out = self.deepthinkvla_model.prompt_cot_predict_action(
                 input_cot_ids=input_cot_ids,
                 pixel_values=pixel_values,
                 attention_mask=attention_mask,
             )
 
-        # Extract action logprobs from masked forward
+        # Extract action logprobs
         if action_tokens is not None:
-            action_tokens_dev = action_tokens.to(logits_masked.device)
-            start_indices = action_start_idx_masked.unsqueeze(1)
+            action_tokens_dev = action_tokens.to(logits_out.device)
+            start_indices = action_start_idx_out.unsqueeze(1)
             position_offsets = torch.arange(
-                self.num_action_chunks * self.action_dim, device=logits_masked.device
+                self.num_action_chunks * self.action_dim, device=logits_out.device
             ).unsqueeze(0)
             seq_indices = start_indices + position_offsets
 
-            action_logits_masked = logits_masked[
-                torch.arange(bsz, device=logits_masked.device).unsqueeze(-1),
+            action_logits = logits_out[
+                torch.arange(bsz, device=logits_out.device).unsqueeze(-1),
                 seq_indices,
                 self.deepthinkvla_model.config.action_token_begin_idx:self.deepthinkvla_model.config.action_token_end_idx + 1,
             ]
 
             action_responses = action_tokens_dev - self.deepthinkvla_model.config.action_token_begin_idx
-            action_logp = torch.nn.functional.log_softmax(action_logits_masked, dim=-1)
+            action_logp = torch.nn.functional.log_softmax(action_logits, dim=-1)
             action_logprobs = torch.gather(action_logp, 2, action_responses.unsqueeze(2)).squeeze(2)
-            masked_action_seq_logprobs = action_logprobs.sum(dim=-1)
+            result_logprobs = action_logprobs.sum(dim=-1)
         else:
-            masked_action_seq_logprobs = torch.zeros(bsz, device=logits_masked.device, dtype=torch.float32)
+            result_logprobs = torch.zeros(bsz, device=logits_out.device, dtype=torch.float32)
 
-        del logits_masked
+        del logits_out
         torch.cuda.empty_cache()
 
-        return masked_action_seq_logprobs
+        return result_logprobs
 
-    def compute_wrong_cot_action_logprobs(
+    def prepare_wrong_cot_inputs(
         self,
         forward_inputs: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """Compute action log-probabilities with wrong (shifted) CoT tokens.
+    ) -> dict[str, torch.Tensor]:
+        """Circularly shift CoT tokens across the batch for wrong-CoT contrastive reward.
 
-        Creates a contrastive input by circularly shifting the CoT tokens
-        across the batch dimension so each sample sees another sample's
-        reasoning. The resulting action log-probabilities can be compared to
-        the normal ones to measure reasoning specificity.
+        This performs the CoT token shift at the full-batch level so the result
+        can be micro-batched for forward passes without losing the cross-batch
+        contrastive property.
 
         Args:
             forward_inputs: Dict with ``input_cot_ids``, ``pixel_values``,
                 ``attention_mask``, ``prompt_lens``, and ``action_tokens``.
 
         Returns:
-            Scalar action-sequence log-probability per sample ``[bsz]``.
+            A new forward_inputs dict with ``input_cot_ids`` containing
+            shifted CoT tokens. All other fields are passed through unchanged.
         """
         input_cot_ids = forward_inputs["input_cot_ids"].clone().to(self.deepthinkvla_model.device)
-        pixel_values = forward_inputs["pixel_values"]
-        attention_mask = forward_inputs["attention_mask"].to(self.deepthinkvla_model.device)
-        action_tokens = forward_inputs.get("action_tokens")
         prompt_lens = forward_inputs.get("prompt_lens")
-
-        if pixel_values.ndim == 5:
-            bsz, num_images = pixel_values.shape[:2]
-            pixel_values = pixel_values.view(bsz * num_images, *pixel_values.shape[2:])
 
         bsz = input_cot_ids.shape[0]
         if bsz <= 1:
-            # Cannot shift with a single sample
-            return torch.zeros(bsz, device=input_cot_ids.device, dtype=torch.float32)
+            # Cannot shift with a single sample; return unmodified
+            return dict(forward_inputs)
 
-        # Determine CoT boundaries to shift only CoT tokens
         pad_id = self.deepthinkvla_model.pad_token_id
-        with torch.no_grad():
-            _, action_start_idx = self.deepthinkvla_model.prompt_cot_predict_action(
-                input_cot_ids=input_cot_ids,
-                pixel_values=pixel_values,
-                attention_mask=attention_mask.clone(),
-            )
+        # Find CoT boundaries from token IDs — no forward pass needed.
+        action_start_idx = self._find_action_start_idx(input_cot_ids)
 
         # Shift CoT tokens circularly across the batch
         if prompt_lens is not None:
             prompt_lens_dev = prompt_lens.to(input_cot_ids.device)
-            # Extract per-sample CoT, roll, and place back
             max_cot_len = 0
             cot_slices = []
             for i in range(bsz):
@@ -323,7 +336,6 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
                 max_cot_len = max(max_cot_len, end - start)
 
             if max_cot_len > 0:
-                # Pad all CoT extracts to same length, roll, then write back
                 cot_tokens = torch.full(
                     (bsz, max_cot_len), pad_id,
                     device=input_cot_ids.device, dtype=input_cot_ids.dtype,
@@ -340,40 +352,10 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
                     if length > 0:
                         input_cot_ids[i, s:e] = cot_tokens_shifted[i, :length]
 
-        # Forward with wrong CoT
-        with torch.no_grad():
-            logits_wrong, action_start_idx_wrong = self.deepthinkvla_model.prompt_cot_predict_action(
-                input_cot_ids=input_cot_ids,
-                pixel_values=pixel_values,
-                attention_mask=attention_mask,
-            )
-
-        # Extract action logprobs from wrong-CoT forward
-        if action_tokens is not None:
-            action_tokens_dev = action_tokens.to(logits_wrong.device)
-            start_indices = action_start_idx_wrong.unsqueeze(1)
-            position_offsets = torch.arange(
-                self.num_action_chunks * self.action_dim, device=logits_wrong.device
-            ).unsqueeze(0)
-            seq_indices = start_indices + position_offsets
-
-            action_logits_wrong = logits_wrong[
-                torch.arange(bsz, device=logits_wrong.device).unsqueeze(-1),
-                seq_indices,
-                self.deepthinkvla_model.config.action_token_begin_idx:self.deepthinkvla_model.config.action_token_end_idx + 1,
-            ]
-
-            action_responses = action_tokens_dev - self.deepthinkvla_model.config.action_token_begin_idx
-            action_logp = torch.nn.functional.log_softmax(action_logits_wrong, dim=-1)
-            action_logprobs = torch.gather(action_logp, 2, action_responses.unsqueeze(2)).squeeze(2)
-            wrong_action_seq_logprobs = action_logprobs.sum(dim=-1)
-        else:
-            wrong_action_seq_logprobs = torch.zeros(bsz, device=logits_wrong.device, dtype=torch.float32)
-
-        del logits_wrong
-        torch.cuda.empty_cache()
-
-        return wrong_action_seq_logprobs
+        # Return new dict with shifted input_cot_ids, everything else unchanged
+        shifted = dict(forward_inputs)
+        shifted["input_cot_ids"] = input_cot_ids
+        return shifted
 
     def predict_action_batch(
         self,
