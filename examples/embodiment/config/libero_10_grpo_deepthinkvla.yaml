@@ -95,7 +95,7 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 64
+    total_num_envs: 8
     reward_coef: ${algorithm.reward_coef}
     group_size: ${algorithm.group_size}
     max_episode_steps: 480 # max episode steps for truncation
