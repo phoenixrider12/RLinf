@@ -37,6 +37,7 @@ from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
     FSDPModelManager,
 )
+from rlinf.hybrid_engines.fsdp import FSDP
 from rlinf.hybrid_engines.fsdp.utils import (
     pack_fsdp_input,
     prepare_pack_fsdp,
@@ -1318,38 +1319,42 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         rewards = rewards.clone()
 
-        # Process in chunks to avoid OOM — iterate over chunk steps
-        for step_idx in range(n_chunk_step):
-            # Build per-step forward_inputs dict
-            step_fi = {}
-            for key, val in forward_inputs.items():
-                if isinstance(val, torch.Tensor):
-                    step_fi[key] = val[step_idx].to(self.device)  # [batch, ...]
-                elif isinstance(val, dict):
-                    step_fi[key] = {
-                        k: v[step_idx].to(self.device) for k, v in val.items()
-                    }
+        # Use summon_full_params to unshard FSDP parameters for custom method
+        # calls (compute_masked/wrong_cot_action_logprobs are not forward(),
+        # so FSDP won't auto-gather sharded params without this context).
+        with FSDP.summon_full_params(self.model, writeback=False, recurse=True):
+            # Process in chunks to avoid OOM — iterate over chunk steps
+            for step_idx in range(n_chunk_step):
+                # Build per-step forward_inputs dict
+                step_fi = {}
+                for key, val in forward_inputs.items():
+                    if isinstance(val, torch.Tensor):
+                        step_fi[key] = val[step_idx].to(self.device)  # [batch, ...]
+                    elif isinstance(val, dict):
+                        step_fi[key] = {
+                            k: v[step_idx].to(self.device) for k, v in val.items()
+                        }
 
-            step_normal_logprobs = normal_action_logprobs[step_idx].to(self.device)  # [batch]
+                step_normal_logprobs = normal_action_logprobs[step_idx].to(self.device)  # [batch]
 
-            if use_cot_causal_reward and cot_causal_reward_coef > 0:
-                masked_logprobs = self.model.compute_masked_cot_action_logprobs(step_fi)
-                causal_bonus = cot_causal_reward_coef * (step_normal_logprobs - masked_logprobs)
-                # Add to the first action chunk (chunk_level reward)
-                rewards[step_idx, :, 0] = rewards[step_idx, :, 0] + causal_bonus.cpu()
-                metrics_out["cot_causal_reward/mean"] = float(causal_bonus.mean().item())
-                metrics_out["cot_causal_reward/std"] = float(causal_bonus.std().item())
-                del masked_logprobs, causal_bonus
+                if use_cot_causal_reward and cot_causal_reward_coef > 0:
+                    masked_logprobs = self.model.compute_masked_cot_action_logprobs(step_fi)
+                    causal_bonus = cot_causal_reward_coef * (step_normal_logprobs - masked_logprobs)
+                    # Add to the first action chunk (chunk_level reward)
+                    rewards[step_idx, :, 0] = rewards[step_idx, :, 0] + causal_bonus.cpu()
+                    metrics_out["cot_causal_reward/mean"] = float(causal_bonus.mean().item())
+                    metrics_out["cot_causal_reward/std"] = float(causal_bonus.std().item())
+                    del masked_logprobs, causal_bonus
 
-            if use_wrong_cot_causal_reward and wrong_cot_causal_reward_coef > 0:
-                wrong_logprobs = self.model.compute_wrong_cot_action_logprobs(step_fi)
-                wrong_bonus = wrong_cot_causal_reward_coef * (step_normal_logprobs - wrong_logprobs)
-                rewards[step_idx, :, 0] = rewards[step_idx, :, 0] + wrong_bonus.cpu()
-                metrics_out["wrong_cot_causal_reward/mean"] = float(wrong_bonus.mean().item())
-                metrics_out["wrong_cot_causal_reward/std"] = float(wrong_bonus.std().item())
-                del wrong_logprobs, wrong_bonus
+                if use_wrong_cot_causal_reward and wrong_cot_causal_reward_coef > 0:
+                    wrong_logprobs = self.model.compute_wrong_cot_action_logprobs(step_fi)
+                    wrong_bonus = wrong_cot_causal_reward_coef * (step_normal_logprobs - wrong_logprobs)
+                    rewards[step_idx, :, 0] = rewards[step_idx, :, 0] + wrong_bonus.cpu()
+                    metrics_out["wrong_cot_causal_reward/mean"] = float(wrong_bonus.mean().item())
+                    metrics_out["wrong_cot_causal_reward/std"] = float(wrong_bonus.std().item())
+                    del wrong_logprobs, wrong_bonus
 
-            clear_memory(sync=False)
+                clear_memory(sync=False)
 
         self.model.train()
         return rewards
