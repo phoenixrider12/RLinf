@@ -1204,13 +1204,50 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return rollout_batch
 
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+        """Compute the advantages and returns.
+
+        When ``use_cot_causal_reward`` or ``use_wrong_cot_causal_reward`` is
+        enabled in the algorithm config, this method additionally runs extra
+        forward passes through the DeepThinkVLA model to compute contrastive
+        action log-probabilities and adds the resulting bonus reward to the
+        rollout rewards before advantage computation.
         """
-        Compute the advantages and returns.
-        """
+        # --- CoT causal reward augmentation ---
+        causal_reward_metrics = {}
+        rewards = self.rollout_batch["rewards"]  # [n_chunk_step, batch, num_action_chunks]
+
+        use_cot_causal_reward = self.cfg.algorithm.get("use_cot_causal_reward", False)
+        cot_causal_reward_coef = self.cfg.algorithm.get("cot_causal_reward_coef", 0.0)
+        use_wrong_cot_causal_reward = self.cfg.algorithm.get("use_wrong_cot_causal_reward", False)
+        wrong_cot_causal_reward_coef = self.cfg.algorithm.get("wrong_cot_causal_reward_coef", 0.0)
+
+        is_deepthinkvla = (
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DEEPTHINKVLA
+        )
+
+        if is_deepthinkvla and (
+            (use_cot_causal_reward and cot_causal_reward_coef > 0)
+            or (use_wrong_cot_causal_reward and wrong_cot_causal_reward_coef > 0)
+        ):
+            # Log the original env reward before augmentation
+            causal_reward_metrics["original_env_rewards"] = float(
+                rewards.mean().item()
+            )
+            rewards = self._compute_cot_causal_rewards(
+                rewards=rewards,
+                use_cot_causal_reward=use_cot_causal_reward,
+                cot_causal_reward_coef=cot_causal_reward_coef,
+                use_wrong_cot_causal_reward=use_wrong_cot_causal_reward,
+                wrong_cot_causal_reward_coef=wrong_cot_causal_reward_coef,
+                metrics_out=causal_reward_metrics,
+            )
+            # Update rollout_batch so compute_rollout_metrics sees augmented rewards
+            self.rollout_batch["rewards"] = rewards
+
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
-            "rewards": self.rollout_batch["rewards"],
+            "rewards": rewards,
             "dones": self.rollout_batch["dones"],
             "values": self.rollout_batch.get("prev_values", None),
             "gamma": self.cfg.algorithm.get("gamma", 1),
@@ -1230,7 +1267,92 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        rollout_metrics.update(causal_reward_metrics)
         return rollout_metrics
+
+    def _compute_cot_causal_rewards(
+        self,
+        rewards: torch.Tensor,
+        use_cot_causal_reward: bool,
+        cot_causal_reward_coef: float,
+        use_wrong_cot_causal_reward: bool,
+        wrong_cot_causal_reward_coef: float,
+        metrics_out: dict,
+    ) -> torch.Tensor:
+        """Run extra forward passes to compute CoT causal bonus rewards.
+
+        The rewards tensor is augmented in-place (or a new tensor is returned)
+        with bonus rewards derived from contrastive forward passes.
+
+        Args:
+            rewards: Original environment rewards ``[n_chunk_step, batch, num_action_chunks]``.
+            use_cot_causal_reward: Whether to add masked-CoT causal reward.
+            cot_causal_reward_coef: Coefficient for the masked-CoT reward.
+            use_wrong_cot_causal_reward: Whether to add wrong-CoT causal reward.
+            wrong_cot_causal_reward_coef: Coefficient for the wrong-CoT reward.
+            metrics_out: Dict to populate with logged metrics.
+
+        Returns:
+            Augmented rewards tensor with the same shape as input.
+        """
+        forward_inputs = self.rollout_batch.get("forward_inputs", None)
+        prev_logprobs = self.rollout_batch.get("prev_logprobs", None)
+
+        if forward_inputs is None or prev_logprobs is None:
+            self.log_warning("CoT causal reward enabled but forward_inputs or prev_logprobs missing; skipping.")
+            return rewards
+
+        # forward_inputs shape: {key: [n_chunk_step, batch, ...]}
+        # prev_logprobs shape: [n_chunk_step, batch, num_action_chunks, action_dim]
+        # We need to flatten the step & batch dims, run the model, then reshape.
+        n_chunk_step, batch_size = rewards.shape[:2]
+
+        # The normal action seq logprob is stored in prev_logprobs[:, :, 0, 0]
+        # (the dummy packing used by DeepThinkVLA puts the full seq logprob there)
+        normal_action_logprobs = prev_logprobs[:, :, 0, 0]  # [n_chunk_step, batch]
+
+        # Ensure model is on GPU for the extra forward passes
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+        self.model.eval()
+
+        rewards = rewards.clone()
+
+        # Process in chunks to avoid OOM — iterate over chunk steps
+        for step_idx in range(n_chunk_step):
+            # Build per-step forward_inputs dict
+            step_fi = {}
+            for key, val in forward_inputs.items():
+                if isinstance(val, torch.Tensor):
+                    step_fi[key] = val[step_idx].to(self.device)  # [batch, ...]
+                elif isinstance(val, dict):
+                    step_fi[key] = {
+                        k: v[step_idx].to(self.device) for k, v in val.items()
+                    }
+
+            step_normal_logprobs = normal_action_logprobs[step_idx].to(self.device)  # [batch]
+
+            if use_cot_causal_reward and cot_causal_reward_coef > 0:
+                masked_logprobs = self.model.compute_masked_cot_action_logprobs(step_fi)
+                causal_bonus = cot_causal_reward_coef * (step_normal_logprobs - masked_logprobs)
+                # Add to the first action chunk (chunk_level reward)
+                rewards[step_idx, :, 0] = rewards[step_idx, :, 0] + causal_bonus.cpu()
+                metrics_out["cot_causal_reward/mean"] = float(causal_bonus.mean().item())
+                metrics_out["cot_causal_reward/std"] = float(causal_bonus.std().item())
+                del masked_logprobs, causal_bonus
+
+            if use_wrong_cot_causal_reward and wrong_cot_causal_reward_coef > 0:
+                wrong_logprobs = self.model.compute_wrong_cot_action_logprobs(step_fi)
+                wrong_bonus = wrong_cot_causal_reward_coef * (step_normal_logprobs - wrong_logprobs)
+                rewards[step_idx, :, 0] = rewards[step_idx, :, 0] + wrong_bonus.cpu()
+                metrics_out["wrong_cot_causal_reward/mean"] = float(wrong_bonus.mean().item())
+                metrics_out["wrong_cot_causal_reward/std"] = float(wrong_bonus.std().item())
+                del wrong_logprobs, wrong_bonus
+
+            clear_memory(sync=False)
+
+        self.model.train()
+        return rewards
 
     def _build_sft_data_loader(self):
         if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
