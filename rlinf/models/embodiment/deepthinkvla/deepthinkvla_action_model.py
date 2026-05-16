@@ -182,7 +182,7 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         return result
 
-    def _find_action_start_idx(self, input_cot_ids: torch.Tensor) -> torch.Tensor:
+    def _find_action_start_idx(self, input_cot_ids: torch.Tensor, prompt_lens: torch.Tensor = None) -> torch.Tensor:
         """Find the first action token position in each sequence without a forward pass.
 
         Scans ``input_cot_ids`` for tokens in the action-token range
@@ -191,6 +191,8 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         Args:
             input_cot_ids: Token IDs ``[bsz, seq_len]``.
+            prompt_lens: Optional per-sample prompt length to ensure we only
+                find action tokens in the generation region.
 
         Returns:
             ``action_start_idx`` tensor of shape ``[bsz]`` with the position of
@@ -199,14 +201,22 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         """
         begin_id = self.deepthinkvla_model.config.action_token_begin_idx
         end_id = self.deepthinkvla_model.config.action_token_end_idx
-        # Boolean mask: True where token is an action token
+        
+        # Mask out tokens in the prompt/image region to avoid false positives
         is_action = (input_cot_ids >= begin_id) & (input_cot_ids <= end_id)
+        if prompt_lens is not None:
+            seq_len = input_cot_ids.shape[1]
+            range_tensor = torch.arange(seq_len, device=input_cot_ids.device).unsqueeze(0)
+            # prompt_lens is the count of non-pad tokens in prompt; if left-padded,
+            # we should also mask the leading pads.
+            after_prompt_mask = range_tensor >= prompt_lens.to(input_cot_ids.device).unsqueeze(1)
+            is_action = is_action & after_prompt_mask
+
         # argmax on a bool tensor returns the index of the first True.
-        # If no True exists, argmax returns 0 — we detect that case and
-        # fall back to seq_len - 1.
         first_action_pos = is_action.int().argmax(dim=-1)  # [bsz]
-        # Fix samples where no action token was found (argmax returned 0 but
-        # position 0 is not actually an action token).
+        
+        # If no True exists, argmax returns 0 — we detect that case and
+        # fall back to seq_len - 1. 
         no_action_mask = ~is_action.any(dim=-1)
         first_action_pos[no_action_mask] = input_cot_ids.shape[1] - 1
         return first_action_pos
@@ -248,7 +258,7 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
         bsz = input_cot_ids.shape[0]
 
         # Find action start positions by scanning token IDs — no forward pass needed.
-        action_start_idx = self._find_action_start_idx(input_cot_ids)
+        action_start_idx = self._find_action_start_idx(input_cot_ids, prompt_lens=prompt_lens)
 
         if not skip_masking:
             # Zero out CoT positions in the attention mask
@@ -322,16 +332,34 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         pad_id = self.deepthinkvla_model.pad_token_id
         # Find CoT boundaries from token IDs — no forward pass needed.
-        action_start_idx = self._find_action_start_idx(input_cot_ids)
+        action_start_idx = self._find_action_start_idx(input_cot_ids, prompt_lens=prompt_lens)
 
         # Shift CoT tokens circularly across the batch
         if prompt_lens is not None:
             prompt_lens_dev = prompt_lens.to(input_cot_ids.device)
+            
+            # Explicitly protect image tokens by finding their ID
+            image_token_id = self.processor.tokenizer.convert_tokens_to_ids(
+                self.processor.tokenizer.additional_special_tokens[0]
+            )
+            
             max_cot_len = 0
             cot_slices = []
             for i in range(bsz):
-                start = int(prompt_lens_dev[i].item())
+                # Robustly find CoT start: skip images and prompt text.
+                is_image = (input_cot_ids[i] == image_token_id)
+                if is_image.any():
+                    last_img_idx = torch.where(is_image)[0].max().item()
+                    safe_start = last_img_idx + 1
+                else:
+                    safe_start = 0
+                
+                start = max(int(prompt_lens_dev[i].item()), safe_start)
                 end = int(action_start_idx[i].item())
+                
+                # Ensure end is at least start to avoid negative/wrapped slices
+                if end < start:
+                    end = start
                 cot_slices.append((start, end))
                 max_cot_len = max(max_cot_len, end - start)
 
@@ -350,7 +378,15 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
                 for i, (s, e) in enumerate(cot_slices):
                     length = e - s
                     if length > 0:
-                        input_cot_ids[i, s:e] = cot_tokens_shifted[i, :length]
+                        # Double-check we are not overwriting image tokens
+                        # even if boundaries were slightly off.
+                        target_slice = input_cot_ids[i, s:e]
+                        is_img_in_target = (target_slice == image_token_id)
+                        
+                        # Only write where it's NOT an image token
+                        new_content = cot_tokens_shifted[i, :length]
+                        target_slice[~is_img_in_target] = new_content[~is_img_in_target]
+                        input_cot_ids[i, s:e] = target_slice
 
         # Return new dict with shifted input_cot_ids, everything else unchanged
         shifted = dict(forward_inputs)
@@ -519,7 +555,7 @@ class DeepThinkVLAForRLActionPrediction(nn.Module, BasePolicy):
             "input_cot_ids": return_input_cot_ids.cpu(),
             "attention_mask": return_attention_mask.cpu() if return_attention_mask is not None else torch.ones_like(return_input_cot_ids).cpu(),
             "pixel_values": pixel_values.cpu().view(bsz, num_images_per_sample, *pixel_values.shape[1:]),
-            "prompt_lens": torch.full((bsz,), prompt_len, dtype=torch.int64).cpu(),
+            "prompt_lens": input_ids.ne(self.deepthinkvla_model.pad_token_id).sum(dim=1).cpu(),
             "action": torch.from_numpy(env_chunk_actions).view(bsz, -1),
             "action_tokens": predicted_action_token_ids.cpu()
         }
